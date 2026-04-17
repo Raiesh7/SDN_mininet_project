@@ -1,41 +1,59 @@
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
-from pox.lib.packet import ipv4
+from pox.lib.packet import ipv4, arp
 import random
+import time
 
 log = core.getLogger()
 
-DROP_PROBABILITY = 0.3
+# Traffic tracking
+packet_count = {}
+start_time = time.time()
 
-def _handle_ConnectionUp(event):
-    log.info("Switch connected - installing default forwarding rule")
+BASE_DROP = 0.1   # minimum drop
+MAX_DROP = 0.6    # max drop
+THRESHOLD = 20    # packets for high traffic
 
-    # Install default rule: flood everything
-    msg = of.ofp_flow_mod()
-    msg.priority = 0
-    msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-    event.connection.send(msg)
+def get_drop_probability(src):
+    count = packet_count.get(src, 0)
+
+    if count < THRESHOLD:
+        return BASE_DROP
+    else:
+        return min(MAX_DROP, BASE_DROP + (count / 100))
 
 
 def _handle_PacketIn(event):
     packet = event.parsed
-    ip = packet.find('ipv4')
 
+    # Always allow ARP
+    if packet.find('arp'):
+        msg = of.ofp_packet_out()
+        msg.data = event.ofp
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+        event.connection.send(msg)
+        return
+
+    ip = packet.find('ipv4')
     if not ip:
         return
 
-    src = ip.srcip
-    dst = ip.dstip
+    src = str(ip.srcip)
+    dst = str(ip.dstip)
 
-    # Apply random drop only for h1 -> h2
-    if str(src) == "10.0.0.1" and str(dst) == "10.0.0.2":
+    # 🔹 Count packets per source
+    packet_count[src] = packet_count.get(src, 0) + 1
 
-        if random.random() < DROP_PROBABILITY:
-            log.info(f"[DROP] {src} -> {dst}")
-            return  # drop packet only
+    drop_prob = get_drop_probability(src)
 
+    # Apply only for h1 -> h2
+    if src == "10.0.0.1" and dst == "10.0.0.2":
+
+        if random.random() < drop_prob:
+            log.info(f"[DROP] {src}->{dst} | Prob={drop_prob:.2f}")
+            return
         else:
-            log.info(f"[ALLOW] {src} -> {dst}")
+            log.info(f"[FORWARD] {src}->{dst} | Prob={drop_prob:.2f}")
 
     # Forward packet
     msg = of.ofp_packet_out()
@@ -45,6 +63,5 @@ def _handle_PacketIn(event):
 
 
 def launch():
-    core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
     core.openflow.addListenerByName("PacketIn", _handle_PacketIn)
-    log.info("Stable Random Packet Loss Simulator Started")
+    log.info("Adaptive Packet Loss Simulator Started")
